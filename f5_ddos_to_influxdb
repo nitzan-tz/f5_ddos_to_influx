@@ -1,0 +1,103 @@
+#!/usr/bin/env python
+
+import json
+import requests
+from requests.auth import HTTPBasicAuth
+from requests import ReadTimeout, ConnectTimeout, HTTPError, Timeout, ConnectionError
+import requests.exceptions
+import urllib3
+import os
+import ssl
+import time
+from datetime import datetime
+import pytz
+import logging
+import yaml
+import sys
+from influxdb import InfluxDBClient
+import csv
+
+dev_ip = '192.168.1.1'
+dev_username = 'admin'
+dev_password = 'xxxxx'
+
+client = InfluxDBClient(host='192.168.1.2', port=8086, username='admin', password='admin', ssl=False, verify_ssl=False)
+
+logging.basicConfig(filename="ddos_stats.log", level="DEBUG",
+                    format="%(asctime)s [%(levelname)-8s] %(message)s")
+
+#ssl._create_default_https_context = ssl._create_unverified_context
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+class MyDumper(yaml.Dumper):
+    def increase_indent(self, flow=False, indentless=False):
+        return super(MyDumper, self).increase_indent(flow, False)
+
+
+
+
+
+
+def get_token(bigip, url, creds):
+    payload = {}
+    payload['username'] = creds[0]
+    payload['password'] = creds[1]
+    payload['loginProviderName'] = 'tmos'
+
+    token = bigip.post(url, json.dumps(payload)).json()['token']['token']
+    return token
+
+
+def ddos_stats(bigip, device_ip):
+    command = 'tmctl -c dos_stat'
+
+    params = {
+        "command": "run",
+        "utilCmdArgs": '-c "{0}"'.format(command)
+    }
+    url_path = "https://{0}/mgmt/tm/util/bash".format(device_ip)
+
+    try:
+        r = bigip.post(url_path , json=params, timeout= 10)
+        r.raise_for_status()
+    except (ConnectTimeout, HTTPError, ReadTimeout, Timeout, ConnectionError) as err:
+        logging.info('Error %s' ,err)
+        exit()
+    else:
+        return r
+
+while True:
+    time.sleep(30)
+    b = requests.session()
+    b.headers.update({'Content-Type':'application/json'})
+    b.auth = (dev_username, dev_password)
+    b.verify = False
+    url_base = 'https://%s/mgmt' % dev_ip
+    url_auth = '%s/shared/authn/login' % url_base
+    logging.info('Generating Token')
+    token = get_token(b, url_auth,(dev_username, dev_password))
+    b.auth = None
+    b.headers.update({'X-F5-Auth-Token': token})
+
+
+    response = ddos_stats(b, '192.168.5.102') #apply imish config 
+    a = json.loads(response.content)
+    #print(a['commandResult'])
+
+    lines = a['commandResult'].splitlines()
+    tags = {}
+    fields = {}
+    reader = csv.DictReader(lines)
+    for line in reader:
+    #    print("{} {}".format(line['context_name'],line['vector_name']))
+        for attr in line.keys():
+            if attr in ('context_name', 'vector_name', 'profile_name', 'protocol_type', 'attack_type', 'status'):
+                attr_without_dash = attr.replace("-","") #Influx doesnt like -
+                tags[attr_without_dash] = line[attr]
+            else:
+                attr_without_dash = attr.replace("-","") #Influx doesnt like -
+                fields[attr_without_dash] = int(line[attr])
+    #    print("{} {}".format(tags,fields))
+    #Write to Influx with UTC time zone as other wise influx see the data in the future  
+        client.switch_database('ddos')
+        client.write_points([{"measurement": 'traffic', "tags": tags, "fields": fields, "time": datetime.now(pytz.timezone('UTC'))}])
